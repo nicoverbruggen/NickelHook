@@ -91,4 +91,4 @@ When naming mods, ensure your name is unique and consistent. Do not use names un
 
 ## Tests
 
-Run `sh tests/check.sh` on glibc Linux for x86, x86-64 or ARM32 with a native C compiler. It checks hook chains in every load order, lazy and immediate binding, preload interposition, duplicate hooks, and rollback after failed initialization. It uses fixture libraries and does not require firmware.
+Run `cd tests && go test -v ./...` on glibc Linux for x86, x86-64 or ARM32 with a native C compiler. It checks hook chains in every load order, lazy and immediate binding, preload interposition, duplicate hooks, and rollback after failed initialization. It uses fixture libraries and does not require firmware.
