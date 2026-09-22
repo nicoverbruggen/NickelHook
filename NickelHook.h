@@ -48,7 +48,7 @@ struct nh_hook {
     const char *sym;     // the symbol to hook
     const char *sym_new; // the symbol to replace it with
     const char *lib;     // the library to hook the symbol for
-    void       **out;    // the variable to store the original symbol in, use nh_symoutptr for convenience
+    void       **out;    // previous external hook or original symbol; use nh_symoutptr for convenience
 
     // optional options
     const char *desc;    // default: none  - human-readable description
@@ -78,8 +78,13 @@ __attribute__((visibility("default"))) bool nh_delete_dir(const char *path);
 // for all logging. Messages larger than 256 bytes will be silently  truncated.
 __attribute__((visibility("default"))) void nh_log(const char *fmt, ...) __attribute((format(printf, 1, 2)));
 
+// Compile out messages and their arguments in production mod builds.
+#ifdef NH_NO_LOGGING
+#define nh_log(...) ((void)(0 && (nh_log(__VA_ARGS__), 0)))
+#endif
+
 // nh_dump_log dumps the syslog to a file on the user storage in the format
-// `/mnt/onboard/.kobo/{NickelHook.info->name ?: "NickelHook"}_YYYY-MM-DD_HH-MM-SS.log`.
+// `/mnt/onboard/{NickelHook.info->name ?: "NickelHook"}_YYYY-MM-DD_HH-MM-SS.log`.
 // This is intended for debugging or for dumping the log after a failure. It
 // will be automatically called by NickelHook if initialization fails.
 __attribute__((visibility("default"))) void nh_dump_log();

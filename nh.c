@@ -23,6 +23,7 @@
 // --- private api
 
 extern const struct nh NickelHook;
+extern void nh_resources_uninstalled(void) __attribute__((weak, visibility("hidden")));
 
 // nh_init is the main entry point for NickelHook which sets up the mod
 // according to the information in the external NickelHook struct and handles
@@ -33,8 +34,8 @@ extern const struct nh NickelHook;
 __attribute__((visibility("hidden"))) __attribute__((constructor)) void nh_init();
 
 // nh_dlhook takes a lib handle from dlopen and redirects the specified symbol
-// to another, returning a pointer to the original one. Only calls from within
-// that library itself are affected (because it replaces that library's GOT).
+// to another, returning the previous external hook or the original function.
+// Only calls from that library are affected (it replaces that library's GOT).
 // This function requires glibc and Linux. It should work on any architecture,
 // and it should be resilient to most errors. If it fails, no changes will have
 // been made, NULL is returned and the error is logged with nh_log.
@@ -52,10 +53,11 @@ static void *nh_hook_lib(const char *name, void *libnickel) {
 }
 
 // nh_failsafe_t is a failsafe mechanism for injected shared libraries. It
-// works by moving it to a temporary file (so it won't get loaded the next time)
-// and dlopening itself (to prevent it from being unloaded if it is dlclose'd by
-// whatever dlopen'd it). When it is disarmed, the library is moved back to its
-// original location.
+// works by moving it to a temporary file in the parent directory (so it won't
+// get loaded the next time; Qt 6 loads any file in a plugin directory, so a
+// new name in the same directory is not enough) and dlopening itself (to
+// prevent it from being unloaded if it is dlclose'd by whatever dlopen'd it).
+// When it is disarmed, the library is moved back to its original location.
 typedef struct nh_failsafe_t nh_failsafe_t;
 
 // nh_failsafe_create allocates and arms a failsafe mechanism for the currently
@@ -241,6 +243,11 @@ nh_init_return_err_rhook:
 nh_init_return_err:
     nh_log("(NickelHook) fatal error");
     nh_dump_log();
+    // Keep an incompatible plugin outside Qt's scan directory. Configuration
+    // and logs remain available, and installing a new package retries setup.
+    nh_log("(NickelHook) compatibility failure: leaving plugin parked");
+    free(fs);
+    goto nh_init_return_no_fs;
 
 nh_init_return:
     if (nh->info->failsafe_delay) {
@@ -257,6 +264,7 @@ nh_init_return_no_fs:
 
 // --- log
 
+#ifndef NH_NO_LOGGING
 void nh_log(const char *fmt, ...) {
     static __thread char buf[256] = {0};
     int n;
@@ -275,20 +283,21 @@ void nh_log(const char *fmt, ...) {
     syslog(LOG_DEBUG, "%s", buf);
 }
 
+#endif
+
 void nh_dump_log() {
+#ifndef NH_NO_LOGGING
     char cmd[PATH_MAX];
     time_t t = time(NULL);
     struct tm *l = localtime(&t);
-    if (!l || snprintf(cmd, sizeof(cmd), "logread > '/mnt/onboard/%s_%d-%02d-%02d_%02d-%02d-%02d.log'", NickelHook.info->name ?: "NickelHook", l->tm_year, l->tm_mon, l->tm_mday, l->tm_hour, l->tm_min, l->tm_sec) < 0)
+    if (!l || snprintf(cmd, sizeof(cmd), "logread > '/mnt/onboard/%s_%d-%02d-%02d_%02d-%02d-%02d.log'", NickelHook.info->name ?: "NickelHook", l->tm_year + 1900, l->tm_mon + 1, l->tm_mday, l->tm_hour, l->tm_min, l->tm_sec) < 0)
         strcpy(cmd, "logread > '/mnt/onboard/NickelHook.log'");
-    system(cmd);
+    if (system(cmd))
+        nh_log("(NickelHook) warning: could not dump the log with logread");
+#endif
 }
 
 // --- dlhook
-
-// prevent GCC from giving us warnings everywhere about the format specifiers for the ELF typedefs
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat"
 
 #ifndef ELFW
 #define ELFW(type) _ElfW(ELF, __ELF_NATIVE_CLASS, type)
@@ -304,6 +313,48 @@ void nh_dump_log() {
 #endif
 #endif
 
+struct nh_range {
+    uintptr_t address;
+    size_t size;
+    uintptr_t base;
+    unsigned flags;
+    bool found;
+};
+
+static int nh_find_range(struct dl_phdr_info *info, size_t size, void *opaque) {
+    (void)size;
+    struct nh_range *range = opaque;
+    if (range->base != (uintptr_t)info->dlpi_addr) return 0;
+    for (unsigned i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+        if (p->p_type != PT_LOAD || (p->p_flags & range->flags) != range->flags) continue;
+        uintptr_t start = info->dlpi_addr + p->p_vaddr;
+        if (range->address >= start && range->address - start < p->p_memsz
+                && range->size <= p->p_memsz - (range->address - start)) {
+            range->found = true;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool nh_mapped(struct link_map *lm, const void *address, size_t size, unsigned flags) {
+    struct nh_range range = {(uintptr_t)address, size, lm->l_addr, flags, false};
+    if (!address || !size) return false;
+    dl_iterate_phdr(nh_find_range, &range);
+    return range.found;
+}
+
+static bool nh_executable(void *address) {
+    Dl_info info;
+    if (!dladdr(address, &info)) return false;
+    struct link_map lm = {.l_addr = (uintptr_t)info.dli_fbase};
+#if __arm__
+    address = (void *)((uintptr_t)address & ~(uintptr_t)1);
+#endif
+    return nh_mapped(&lm, address, 1, PF_X);
+}
+
 void *nh_dlhook(void *handle, const char *symname, void *target) {
     #define NH_DLHOOK_CHECK(cond, fmt, ...) do {                                                        \
         if (!(cond)) {                                                                                  \
@@ -313,11 +364,12 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
     } while (0)                                                                                         \
 
     NH_DLHOOK_CHECK(handle && symname && target, "BUG: required arguments are null");
+    NH_DLHOOK_CHECK(nh_executable(target), "replacement is outside executable library memory");
 
     // the link_map conveniently gives use the base address without /proc/maps, and it gives us a pointer to dyn
     struct link_map *lm;
     NH_DLHOOK_CHECK(!dlinfo(handle, RTLD_DI_LINKMAP, &lm), "could not get link_map for lib");
-    nh_log("(NickelHook) ... dlhook: info: lib %s is mapped at %lx", lm->l_name, lm->l_addr);
+    nh_log("(NickelHook) ... dlhook: info: lib %s is mapped at %lx", lm->l_name, (unsigned long)(lm->l_addr));
 
     // stuff extracted from DT_DYNAMIC
     struct {
@@ -331,6 +383,7 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
         ElfW(Xword) plt_ent_sz;
         ElfW(Sym)   *sym;
         const char  *str;
+        size_t str_sz;
     } dyn = {0};
 
     // parse DT_DYNAMIC
@@ -343,12 +396,15 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
         case DT_RELAENT:  if (!dyn.plt_ent_sz) dyn.plt_ent_sz = lm->l_ld[i].d_un.d_val; break; // .rel.plt - entry size if Rela
         case DT_SYMTAB:   dyn.sym         = (ElfW(Sym)*)(lm->l_ld[i].d_un.d_val);       break; // .dynsym  - offset
         case DT_STRTAB:   dyn.str         = (const char*)(lm->l_ld[i].d_un.d_val);      break; // .dynstr  - offset
+        case DT_STRSZ:    dyn.str_sz      = lm->l_ld[i].d_un.d_val;                    break;
         }
     }
-    nh_log("(NickelHook) ... dlhook: info: DT_DYNAMIC: plt_is_rela=%d plt=%p plt_sz=%lu plt_ent_sz=%lu sym=%p str=%p", dyn.plt_is_rela, (void*)(dyn.plt)._, dyn.plt_sz, dyn.plt_ent_sz, dyn.sym, dyn.str);
+    nh_log("(NickelHook) ... dlhook: info: DT_DYNAMIC: plt_is_rela=%d plt=%p plt_sz=%lu plt_ent_sz=%lu sym=%p str=%p", dyn.plt_is_rela, (void*)(dyn.plt)._, (unsigned long)(dyn.plt_sz), (unsigned long)(dyn.plt_ent_sz), (void*)(dyn.sym), (const void*)(dyn.str));
     NH_DLHOOK_CHECK(dyn.plt_ent_sz, "plt_ent_sz is zero");
     NH_DLHOOK_CHECK(dyn.plt_sz%dyn.plt_ent_sz == 0, ".rel.plt length is not a multiple of plt_ent_sz");
-    NH_DLHOOK_CHECK((dyn.plt_is_rela ? sizeof(*dyn.plt.rela) : sizeof(*dyn.plt.rel)) == dyn.plt_ent_sz, "size mismatch (%lu != %lu)", dyn.plt_is_rela ? sizeof(*dyn.plt.rela) : sizeof(*dyn.plt.rel), dyn.plt_ent_sz);
+    NH_DLHOOK_CHECK((dyn.plt_is_rela ? sizeof(*dyn.plt.rela) : sizeof(*dyn.plt.rel)) == dyn.plt_ent_sz, "size mismatch (%lu != %lu)", (unsigned long)(dyn.plt_is_rela ? sizeof(*dyn.plt.rela) : sizeof(*dyn.plt.rel)), (unsigned long)(dyn.plt_ent_sz));
+    NH_DLHOOK_CHECK(nh_mapped(lm, (void *)dyn.plt._, dyn.plt_sz, PF_R), "relocation table is outside readable library memory");
+    NH_DLHOOK_CHECK(nh_mapped(lm, dyn.str, dyn.str_sz, PF_R), "string table is outside readable library memory");
 
     // parse the dynamic symbol table, resolve symbols to relocations, then GOT entries
     for (size_t i = 0; i < dyn.plt_sz/dyn.plt_ent_sz; i++) {
@@ -356,23 +412,50 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
         ElfW(Rel) *rel = dyn.plt_is_rela
             ? (ElfW(Rel)*)(&dyn.plt.rela[i])
             : &dyn.plt.rel[i];
-        NH_DLHOOK_CHECK(ELFW(R_TYPE)(rel->r_info) == R_JUMP_SLOT, "not a jump slot relocation (R_TYPE=%lu)", ELFW(R_TYPE)(rel->r_info));
+        NH_DLHOOK_CHECK(ELFW(R_TYPE)(rel->r_info) == R_JUMP_SLOT, "not a jump slot relocation (R_TYPE=%lu)", (unsigned long)(ELFW(R_TYPE)(rel->r_info)));
 
-        ElfW(Sym) *sym = &dyn.sym[ELFW(R_SYM)(rel->r_info)];
+        size_t index = ELFW(R_SYM)(rel->r_info);
+        NH_DLHOOK_CHECK(index <= (UINTPTR_MAX - (uintptr_t)dyn.sym) / sizeof(*dyn.sym), "symbol address overflow");
+        ElfW(Sym) *sym = (ElfW(Sym) *)((uintptr_t)dyn.sym + index * sizeof(*dyn.sym));
+        NH_DLHOOK_CHECK(nh_mapped(lm, sym, sizeof(*sym), PF_R), "symbol is outside readable library memory");
+        NH_DLHOOK_CHECK(sym->st_name < dyn.str_sz, "symbol name is outside string table");
         const char *str = &dyn.str[sym->st_name];
+        NH_DLHOOK_CHECK(memchr(str, 0, dyn.str_sz - sym->st_name), "unterminated symbol name");
         if (strcmp(str, symname))
             continue;
 
+        NH_DLHOOK_CHECK(rel->r_offset <= UINTPTR_MAX - lm->l_addr, "GOT address overflow");
         void **gotoff = (void**)(lm->l_addr + rel->r_offset);
+        NH_DLHOOK_CHECK((uintptr_t)gotoff % sizeof(void *) == 0
+            && nh_mapped(lm, gotoff, sizeof(*gotoff), PF_R | PF_W), "GOT slot is outside writable library segment");
         nh_log("(NickelHook) ... dlhook: info: found symbol %s (gotoff=%p [mapped=%p])", str, (void*)(rel->r_offset), gotoff);
 
         NH_DLHOOK_CHECK(ELFW(ST_TYPE)(sym->st_info) != STT_GNU_IFUNC, "STT_GNU_IFUNC not implemented (gotoff=%p)", (void*)(rel->r_offset));
-        NH_DLHOOK_CHECK(ELFW(ST_TYPE)(sym->st_info) == STT_FUNC, "not a function symbol (ST_TYPE=%d) (gotoff=%p)", ELFW(ST_TYPE)(sym->st_info), (void*)(rel->r_offset));
-        NH_DLHOOK_CHECK(ELFW(ST_BIND)(sym->st_info) == STB_GLOBAL, "not a globally bound symbol (ST_BIND=%d) (gotoff=%p)", ELFW(ST_BIND)(sym->st_info), (void*)(rel->r_offset));
+        NH_DLHOOK_CHECK(ELFW(ST_TYPE)(sym->st_info) == STT_FUNC, "not a function symbol (ST_TYPE=%d) (gotoff=%p)", (int)(ELFW(ST_TYPE)(sym->st_info)), (void*)(rel->r_offset));
+        NH_DLHOOK_CHECK(ELFW(ST_BIND)(sym->st_info) == STB_GLOBAL, "not a globally bound symbol (ST_BIND=%d) (gotoff=%p)", (int)(ELFW(ST_BIND)(sym->st_info)), (void*)(rel->r_offset));
 
-        nh_log("(NickelHook) ... dlhook: info: ensuring the symbol is loaded (to get the original address)");
+        nh_log("(NickelHook) ... dlhook: info: resolving the original symbol");
         void *orig = dlsym(handle, symname);
         NH_DLHOOK_CHECK(orig, "could not dlsym symbol");
+        NH_DLHOOK_CHECK(*gotoff != target, "target is already installed");
+
+        // dlsym does not resolve a lazy GOT slot or report another mod's hook.
+        // ARM and x86-64 lazy slots point into the calling library's PLT.
+        // Resolve lazy slots in the global scope first to retain LD_PRELOAD
+        // interposers. A handle-only lookup can skip those. Already resolved
+        // external slots must keep their current target, including other mods.
+        Dl_info previous;
+        if (*gotoff != orig && dladdr(*gotoff, &previous)) {
+            if (previous.dli_fbase != (void *)lm->l_addr) {
+                orig = *gotoff;
+                nh_log("(NickelHook) ... dlhook: info: preserving previous hook %p in %s", orig, previous.dli_fname);
+            } else {
+                void *global = dlsym(RTLD_DEFAULT, symname);
+                if (global) orig = global;
+            }
+        }
+        NH_DLHOOK_CHECK(orig != target, "target would call itself");
+        NH_DLHOOK_CHECK(nh_executable(orig), "previous function is outside executable library memory");
 
         // remove memory protection (to bypass RELRO if it is enabled)
         // note: this doesn't seem to be used on the Kobo, but we might as well stay on the safe side (plus, I test this on my local machine too)
@@ -386,7 +469,6 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
 
         // replace the target offset
         nh_log("(NickelHook) ... dlhook: info: patching symbol");
-        //void *orig = *gotoff;
         *gotoff = target;
         nh_log("(NickelHook) ... dlhook: info: successfully patched symbol %s (orig=%p, new=%p)", str, orig, target);
 
@@ -398,8 +480,6 @@ void *nh_dlhook(void *handle, const char *symname, void *target) {
 
     #undef NH_DLHOOK_CHECK
 }
-
-#pragma GCC diagnostic pop
 
 // --- failsafe
 
@@ -429,7 +509,14 @@ nh_failsafe_t *nh_failsafe_create() {
     char *d = strrchr(info.dli_fname, '.');
     NH_FAILSAFE_CHECK(!(d && !strcmp(d, ".failsafe")), "lib was loaded from the failsafe for some reason");
     NH_FAILSAFE_CHECK(realpath(info.dli_fname, fs->orig), "could not resolve %s", info.dli_fname);
-    NH_FAILSAFE_CHECK(snprintf(fs->tmp, sizeof(fs->tmp), "%s.failsafe", fs->orig) >= 0, "could not generate temp filename");
+
+    // /usr/local/Kobo/imageformats/libnm.so becomes /usr/local/Kobo/libnm.so.failsafe:
+    // one directory up, where no plugin loader looks, on the same filesystem so rename works.
+    const char *base = strrchr(fs->orig, '/');
+    NH_FAILSAFE_CHECK(base && base != fs->orig, "own path %s has no parent directory", fs->orig);
+    const char *parent = memrchr(fs->orig, '/', base - fs->orig);
+    NH_FAILSAFE_CHECK(parent, "own path %s has no parent directory", fs->orig);
+    NH_FAILSAFE_CHECK(snprintf(fs->tmp, sizeof(fs->tmp), "%.*s%s.failsafe", (int)(parent - fs->orig + 1), fs->orig, base + 1) < (int)(sizeof(fs->tmp)), "could not generate temp filename");
 
     nh_log("(NickelHook) ... failsafe: info: ensuring own lib remains in memory even if it is dlclosed after being loaded with a dlopen");
     NH_FAILSAFE_CHECK((fs->self = dlopen(fs->orig, RTLD_LAZY|RTLD_NODELETE)), "could not dlopen self");
@@ -477,7 +564,7 @@ void nh_failsafe_destroy(nh_failsafe_t *fs, int delay) {
 
 void nh_failsafe_uninstall(nh_failsafe_t *fs) {
     nh_log("(NickelHook) ... failsafe: info: deleting %s", fs->tmp);
-    unlink(fs->tmp);
+    if (unlink(fs->tmp) == 0 && nh_resources_uninstalled) nh_resources_uninstalled();
 }
 
 // --- File/directory deletion

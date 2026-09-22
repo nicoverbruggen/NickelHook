@@ -2,3 +2,6 @@
 /nhplugin.json
 /nhplugin.moc
 /nhplugin.moc.o
+
+*.d
+/Kobo.tgz

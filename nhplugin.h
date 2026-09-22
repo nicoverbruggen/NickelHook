@@ -12,8 +12,8 @@ class NHPlugin : public QImageIOPlugin {
     Q_OBJECT
     Q_PLUGIN_METADATA(IID "org.qt-project.Qt.QImageIOHandlerFactoryInterface" FILE "nhplugin.json")
 public:
-    Capabilities capabilities(QIODevice*, QByteArray const&) const { return 0; };
-    QImageIOHandler *create(QIODevice*, QByteArray const& = QByteArray()) const { return 0; };
+    Capabilities capabilities(QIODevice*, QByteArray const&) const override { return {}; };
+    QImageIOHandler *create(QIODevice*, QByteArray const& = QByteArray()) const override { return nullptr; };
 };
 
 #endif

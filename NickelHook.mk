@@ -12,7 +12,11 @@ endef
 ifneq ($(firstword $(MAKEFILE_LIST)),$(lastword $(MAKEFILE_LIST)))
 
 ifndef nh_top
-CROSS_COMPILE = arm-nickel-linux-gnueabihf-
+NH_QT_MAJOR ?= 5
+ifeq ($(filter $(NH_QT_MAJOR),5 6),)
+$(error NH_QT_MAJOR must be 5 or 6)
+endif
+CROSS_COMPILE = $(if $(filter 6,$(NH_QT_MAJOR)),arm-kobo-linux-gnueabihf-,arm-nickel-linux-gnueabihf-)
 MOC           = moc
 RCC           = rcc
 CC            = $(CROSS_COMPILE)gcc
@@ -42,24 +46,28 @@ endif
 
 ifdef nh_top
 ## variable: NickelHook dir
-NICKELHOOK ?= $(dir $(lastword $(MAKEFILE_LIST)))
+ifndef NICKELHOOK
+NICKELHOOK := $(dir $(lastword $(MAKEFILE_LIST)))
+endif
+
+override NICKELHOOK := $(patsubst %/,%,$(NICKELHOOK))/
 
 ## variable: pkg-config dependencies (will be added to CFLAGS/CXXFLAGS/LDFLAGS)
 # override PKGCONF += <dep>
 # override PKGCONF += <NAME>,<dep>
 # override PKGCONF += <NAME>,<dep>,<--constraint=...>
-override PKGCONF += Qt5Core Qt5Gui
+override PKGCONF += Qt$(NH_QT_MAJOR)Core Qt$(NH_QT_MAJOR)Gui
 
 ## variable: allows pkg-config to be skipped for certain targets
 # override SKIPCONFIGURE += <target>
-override SKIPCONFIGURE += clean gitignore install koboroot
+override SKIPCONFIGURE += clean gitignore
 
 ## variable: flags
 # override VARIABLE += <flags>
 override CPPFLAGS += -I$(NICKELHOOK)
-override CFLAGS   += -std=gnu11 -pthread
-override CXXFLAGS += -std=gnu++11 -pthread
-override LDFLAGS  += -Wl,--no-undefined -Wl,-rpath,/usr/local/Kobo -Wl,-rpath,/usr/local/Qt-5.2.1-arm/lib -pthread -ldl
+override CFLAGS   += -std=gnu11 -pthread -MMD -MP
+override CXXFLAGS += -std=gnu++$(if $(filter 6,$(NH_QT_MAJOR)),17,11) -pthread -MMD -MP
+override LDFLAGS  += -Wl,--no-undefined -Wl,-rpath,/usr/local/Kobo $(if $(filter 5,$(NH_QT_MAJOR)),-Wl$(nh_comma)-rpath$(nh_comma)/usr/local/Qt-5.2.1-arm/lib) -pthread -ldl
 
 ## variable: version (don't set this unless you don't use git)
 # override VERSION := <version>
@@ -103,7 +111,12 @@ override RCCS_RCC     := $(filter %.rcc,$(QRCS:%.qrc=%.rcc))
 override OBJECTS_MOC  := $(MOCS_MOC:%=%.o)
 override OBJECTS_RCC  := $(RCCS_RCC:%=%.o)
 override OBJECTS_MISC := $(NICKELHOOK)nhplugin.json
-override GENERATED    += KoboRoot.tgz $(LIBRARY) $(OBJECTS_C) $(OBJECTS_CXX) $(OBJECTS_CXX1) $(MOCS_MOC) $(OBJECTS_MOC) $(RCCS_RCC) $(OBJECTS_RCC) $(OBJECTS_MISC)
+override GENERATED    += KoboRoot.tgz Kobo.tgz $(LIBRARY) $(OBJECTS_C) $(OBJECTS_CXX) $(OBJECTS_CXX1) $(MOCS_MOC) $(OBJECTS_MOC) $(RCCS_RCC) $(OBJECTS_RCC) $(OBJECTS_MISC)
+
+# Track local headers, including generated resources.
+override nh_dependencies := $(patsubst %.o,%.d,$(OBJECTS_C) $(OBJECTS_CXX) $(OBJECTS_CXX1) $(OBJECTS_MOC) $(OBJECTS_RCC))
+override GENERATED += $(nh_dependencies)
+-include $(nh_dependencies)
 
 ## gitignore
 # override GITIGNORE += <pattern>
@@ -115,7 +128,9 @@ ifneq ($(if $(MAKECMDGOALS),$(if $(filter-out $(SKIPCONFIGURE),$(MAKECMDGOALS)),
  $(info -- Skipping configure)
 else
 
-ifeq ($(CROSS_COMPILE),arm-nickel-linux-gnueabihf-)
+ifeq ($(NH_QT_MAJOR),6)
+$(if $(shell command -v $(CC)),,$(error Could not find the supplied Qt6 cross compiler: $(CC)))
+else ifeq ($(CROSS_COMPILE),arm-nickel-linux-gnueabihf-)
 $(if $(shell which $(CROSS_COMPILE)gcc),,$(error Could not find NickelTC. NickelTC can be downloaded from https://github.com/pgaskin/NickelTC/actions?query=branch%3Amaster+is%3Asuccess or used from the Docker image geek1011/nickeltc))
 else
 $(if $(filter clangd,$(MAKECMDGOALS)),,$(info -- Warning: Not using NickelTC (or it was compiled with a different prefix), built library may not work properly on the device.))
@@ -182,16 +197,27 @@ gitignore:
 	echo "$(strip $(GITIGNORE))" | tr " " "\n" >> .gitignore
 
 define nh_install =
-install:
+install: $(LIBRARY)
 	$(foreach file,$(1),$(nh_newline)$(shell printf '\011')install -Dm644 $(word 1,$(subst :, ,$(file))) $(DESTDIR)$(word 2,$(subst :, ,$(file))))
 endef
 
 $(eval $(call nh_install,$(KOBOROOT)))
 
-koboroot:
+# Qt6 firmware extracts Kobo.tgz under /usr/local/Kobo. Only the plugin belongs there.
+kobo: $(LIBRARY)
+ifeq ($(NH_QT_MAJOR),6)
+	tar cvzf Kobo.tgz --show-transformed --owner=root --group=root --mode="u=rwX,go=rX" --transform="s,$(LIBRARY),imageformats/$(notdir $(LIBRARY))," $(LIBRARY)
+else
+	$(error Use koboroot for a Qt5 build)
+endif
+
+koboroot: $(LIBRARY)
+ifeq ($(NH_QT_MAJOR),6)
+	$(error Use kobo for a Qt6 build)
+endif
 	tar cvzf KoboRoot.tgz --show-transformed --owner=root --group=root --mode="u=rwX,go=rX" $(foreach file,$(KOBOROOT),--transform="s,$(word 1,$(subst :, ,$(file))),.$(word 2,$(subst :, ,$(file))),") $(foreach file,$(KOBOROOT),$(word 1,$(subst :, ,$(file))))
 
-.PHONY: all clean gitignore install koboroot
+.PHONY: all clean gitignore install koboroot kobo
 
 %.so clangd: override CFLAGS   += -fPIC
 %.so clangd: override CXXFLAGS += -fPIC
@@ -210,11 +236,11 @@ override nh_cmd_rcccc = $(RCC) $(2) -o $(1)
 $(LIBRARY): %.so:
 	$(call nh_cmd_so,$@,$^)
 $(OBJECTS_C): %.o: %.c
-	$(call nh_cmd_c,$@,$^)
+	$(call nh_cmd_c,$@,$<)
 $(OBJECTS_CXX): %.o: %.cc
-	$(call nh_cmd_cc,$@,$^)
+	$(call nh_cmd_cc,$@,$<)
 $(OBJECTS_CXX1): %.o: %.cpp
-	$(call nh_cmd_cc,$@,$^)
+	$(call nh_cmd_cc,$@,$<)
 $(OBJECTS_MOC): %.moc.o: %.moc
 	$(call nh_cmd_moco,$@,$<)
 $(MOCS_MOC): %.moc: %.h
