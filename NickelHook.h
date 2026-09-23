@@ -13,7 +13,7 @@ extern "C" {
 
 #define NickelHook(...)                    \
     __attribute__((visibility("default"))) \
-    struct nh NickelHook = (struct nh){    \
+    struct nh NickelHook = {               \
         __VA_ARGS__                        \
     };                                     \
 

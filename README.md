@@ -28,18 +28,8 @@ Unless you are interested in developing your own mod, you probably are looking f
 1. Copy this folder to your project, or include it as a git submodule.
 2. Run `make -f ./relative/path/to/NickelHook.mk NAME=MyModName`.
 3. Build using `make`. To generate a KoboRoot.tgz, run `make koboroot` after building. To clean, run `make clean`.
-4. Header dependencies are tracked automatically. Run `make clean` when switching Qt versions or toolchains. If you add/remove source files, run `make gitignore`.
+4. Whenever you change header files, run `make clean`. If you add/remove source files, run `make gitignore`.
 5. To generate a compile_commands.json, use `make clangd CROSS_COMPILE= CC=clang-10 CXX=clang++-10 CFLAGS= CXXFLAGS=`.
-
-## Qt6 builds
-
-The existing Qt5 build is the default. Set `NH_QT_MAJOR=6` to use Qt6Core and Qt6Gui, C++17, and the `arm-kobo-linux-gnueabihf-` toolchain prefix. Supply a Kobo-compatible cross-toolchain; `CROSS_COMPILE`, `PKG_CONFIG`, `MOC`, and `RCC` accept overrides. Mod makefiles must select their other Qt dependencies for the same Qt major version.
-
-Use `make NH_QT_MAJOR=6 all kobo` to generate `Kobo.tgz` for Qt6 firmware, including 5.18 and 6.0. It contains only the plugin under `imageformats/`. `KoboRoot.tgz` remains the Qt5 package. Clean before switching Qt versions.
-
-Mods can embed first-run files with `embed_resources.py` and opt in by compiling `resources.c` and defining `nh_resources` from `resources.h`. Files are created on user storage without replacing existing files. The initialization receipt sits beside the configuration directory so removing that directory can still request uninstall. Explicit uninstall clears the receipt.
-
-Hooks validate mapped relocation, symbol, string and GOT ranges before patching. The previous external hook remains in the call chain. Initialization failure rolls back applied hooks and leaves the plugin outside Qt's imageformats scan directory. Reinstalling retries initialization. Optional hooks and symbols remain optional; each mod must check them before use. Neither symbol presence nor mapped memory alone proves a private C++ layout is compatible.
 
 ## Features
 - Generates a Qt plugin designed for use with Nickel.
@@ -82,13 +72,24 @@ Also, keep in mind thread/memory safety, especially regarding pointers to object
 
 Another thing to consider is that your mod will continue to run while the Kobo is turned on. This includes during USB mass storage sessions. As such, you must ensure you aren't using excessive CPU time (this may cause slowness or battery life issues), IO (remember that you're running on a SD card) or memory (most people leave their devices on for weeks or months at a time, and you don't want Nickel to run out of memory). In addition, you should never hold on to file handles on the user storage partition `/mnt/onboard` for any length of time (longer than a few hundred milliseconds), as this is likely cause issues (and possibly corruption) when connecting over USB. The safest time to access files there is in the init function (the partition is guaranteed to be mounted at that point) or during a Qt signal handler, as you'll have complete control at those points.
 
-Qt5 NickelHook mods should be built with [NickelTC](https://github.com/pgaskin/NickelTC) for compatibility and stability. Qt6 builds require a supplied Kobo-compatible Qt6 cross-toolchain. It is OK to build using a different compiler targeting the host during development if needed for things like static analysis (ex: you can use `scan-build make clean all CROSS_COMPILE= CFLAGS= CXXFLAGS=`) or for other tooling-related functionality (ex: generating a clangd compilation database for IDE support using `make clangd CROSS_COMPILE= CC=clang CXX=clang++ CFLAGS= CXXFLAGS=`), but keep in mind that NickelTC uses an ancient GCC version and may not features from newer compilers.
+All NickelHook mods should be built with [NickelTC](https://github.com/pgaskin/NickelTC) for compatibility and stability. It is OK to build using a different compiler targeting the host during development if needed for things like static analysis (ex: you can use `scan-build make clean all CROSS_COMPILE= CFLAGS= CXXFLAGS=`) or for other tooling-related functionality (ex: generating a clangd compilation database for IDE support using `make clangd CROSS_COMPILE= CC=clang CXX=clang++ CFLAGS= CXXFLAGS=`), but keep in mind that NickelTC uses an ancient GCC version and may not features from newer compilers.
 
 When naming mods, ensure your name is unique and consistent. Do not use names under 3 letters (like `libnm.so`), as those are reserved for our mods (ex: [pgaskin/NickelMenu](https://github.com/pgaskin/NickelMenu), [pgaskin/kobo-mods](https://github.com/pgaskin/kobo-mods), [shermp/NickelDBus](https://github.com/shermp/NickelDBus)).
 
 <!-- TODO: more usage? -->
 <!-- TODO: tips and tricks? -->
 
-## Tests
+## Qt6 support and builds
 
-Run `cd tests && go test -v ./...` on glibc Linux for x86, x86-64 or ARM32 with a native C compiler. It checks hook chains in every load order, lazy and immediate binding, preload interposition, duplicate hooks, and rollback after failed initialization. It uses fixture libraries and does not require firmware.
+This branch supports Qt6 on Kobo firmware 5.18 and 6.0. Qt5 remains the default. In the mod's directory, with a Kobo-compatible Qt 6.5.2 ARM toolchain on `PATH`, build a separate Qt6 binary:
+
+```sh
+make clean
+make NH_QT_MAJOR=6 all kobo
+```
+
+This selects Qt6 libraries, C++17 and the `arm-kobo-linux-gnueabihf-` compiler prefix. Toolchain paths can be overridden with `CROSS_COMPILE`, `PKG_CONFIG`, `MOC` and `RCC`.
+
+`Kobo.tgz` contains only the plugin under `imageformats/`. Firmware extracts it directly into `/usr/local/Kobo` on the system partition, so it cannot install support files onto the user partition. This port provides `embed_resources.c` to embed those files in the plugin and `resources.c` to create them on user storage at first startup without replacing existing files. This keeps installation to a single package. Embedding is optional; asking users to copy a separate `.adds` folder is also valid.
+
+Qt6 scans every file in the plugin directory, so the failsafe parks the plugin one directory above it. A required initialization failure leaves it parked; reinstalling a corrected package retries initialization.
